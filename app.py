@@ -235,7 +235,7 @@ def get_jenny_reply(user_id, user_message, form_completed=False):
 
     try:
         response = claude_client.messages.create(
-            model="claude-sonnet-4-5-20250514",
+            model="claude-sonnet-4-20250514",
             max_tokens=500,  # Keep replies concise for chat
             system=system_prompt,
             messages=messages
