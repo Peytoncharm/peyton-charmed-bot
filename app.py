@@ -30,8 +30,12 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ZOHO_WEBHOOK_URL = os.environ.get("ZOHO_WEBHOOK_URL", "")
 
-# Team notifications: Access token for separate LINE OA used for team alerts
-LINE_TEAM_ACCESS_TOKEN = os.environ.get("LINE_TEAM_ACCESS_TOKEN", "")
+# Team notifications via email
+TEAM_EMAIL_ADDRESSES = os.environ.get("TEAM_EMAIL_ADDRESSES", "")  # Comma-separated emails
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")  # Gmail account for sending
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")  # Gmail app password
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = os.environ.get("SMTP_PORT", "587")
 
 # Optional: Set to "true" to disable Claude replies (forwarding only)
 FORWARDING_ONLY = os.environ.get("FORWARDING_ONLY", "false").lower() == "true"
@@ -145,51 +149,84 @@ def reply_to_line(reply_token, text):
         logger.error(f"Failed to reply on LINE: {e}")
 
 # ============================================================
-# TEAM NOTIFICATION
+# TEAM NOTIFICATION (EMAIL)
 # ============================================================
 def send_team_notification(user_message, handoff_reason):
-    """Send notification to team LINE OA when handoff is triggered."""
-    if not LINE_TEAM_ACCESS_TOKEN:
-        logger.warning("LINE_TEAM_ACCESS_TOKEN not set, skipping team notification")
+    """Send email notification to team when handoff is triggered."""
+    
+    # Get team email addresses from environment variable
+    team_emails = os.environ.get("TEAM_EMAIL_ADDRESSES", "").split(",")
+    team_emails = [email.strip() for email in team_emails if email.strip()]
+    
+    if not team_emails:
+        logger.warning("TEAM_EMAIL_ADDRESSES not set, skipping team notification")
         return
 
-    # Determine topic emoji based on handoff reason
-    topic_emojis = {
-        "booking": "📋 เรื่อง: การจอง",
-        "payment": "💳 เรื่อง: การชำระเงิน", 
-        "contract": "📄 เรื่อง: สัญญา",
-        "visa": "📘 เรื่อง: วีซ่า",
-        "unknown": "❓ เรื่อง: อื่นๆ"
+    # Determine topic based on handoff reason
+    topic_subjects = {
+        "booking": "🏠 New Booking Request",
+        "payment": "💳 Payment Inquiry", 
+        "contract": "📄 Contract Question",
+        "visa": "📘 Visa Support Request",
+        "unknown": "❓ Customer Needs Help"
     }
     
-    topic = topic_emojis.get(handoff_reason, "❓ เรื่อง: อื่นๆ")
+    subject = topic_subjects.get(handoff_reason, "❓ Customer Needs Help")
     
     # Truncate message if too long
-    if len(user_message) > 100:
-        user_message = user_message[:100] + "..."
+    if len(user_message) > 200:
+        user_message = user_message[:200] + "..."
     
-    notification_text = (
-        f"🔔 ลูกค้าต้องการทีมช่วย\n"
-        f"{topic}\n"
-        f"💬 \"{user_message}\""
-    )
+    # Create email content
+    email_body = f"""
+A customer needs team assistance:
 
-    url = "https://api.line.me/v2/bot/message/broadcast"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_TEAM_ACCESS_TOKEN}"
-    }
-    data = {
-        "messages": [{"type": "text", "text": notification_text}]
-    }
-    
+Topic: {handoff_reason.title()}
+Customer Message: "{user_message}"
+
+Please check Zoho CRM for full customer details and follow up accordingly.
+
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+Peyton & Charmed Bot Alert System
+"""
+
+    # Send email via simple SMTP (using Gmail SMTP as example)
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=10)
-        logger.info(f"Team notification sent: status {response.status_code}")
-        if response.status_code != 200:
-            logger.error(f"Team notification error: {response.text}")
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        
+        # Email configuration from environment variables
+        smtp_server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        sender_email = os.environ.get("SENDER_EMAIL", "")
+        sender_password = os.environ.get("SENDER_PASSWORD", "")
+        
+        if not sender_email or not sender_password:
+            logger.warning("Email credentials not configured, skipping notification")
+            return
+        
+        # Create message
+        message = MIMEMultipart()
+        message["From"] = sender_email
+        message["To"] = ", ".join(team_emails)
+        message["Subject"] = subject
+        message.attach(MIMEText(email_body, "plain"))
+        
+        # Send email
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        text = message.as_string()
+        server.sendmail(sender_email, team_emails, text)
+        server.quit()
+        
+        logger.info(f"Team notification email sent to {len(team_emails)} recipients")
+        
     except Exception as e:
-        logger.error(f"Failed to send team notification: {e}")
+        logger.error(f"Failed to send team notification email: {e}")
 
 def detect_handoff_trigger(bot_reply):
     """
@@ -197,11 +234,11 @@ def detect_handoff_trigger(bot_reply):
     Returns handoff reason if triggered, None otherwise.
     """
     handoff_triggers = {
-        "booking": ["จองห้อง", "การจอง", "ทีมจะติดต่อกลับค่ะ", "ติดต่อกลับ", "เช็คข้อมูลในแบบฟอร์ม"],
+        "booking": ["จองห้อง", "การจอง", "ทีมจะติดต่อกลับค่ะ", "ติดต่อกลับ", "เช็คข้อมูลในแบบฟอร์ม", "โทรมาหาทีมงาน"],
         "payment": ["ชำระเงิน", "การชำระ", "เงินมัดจำ", "ค่าเช่า"],
         "contract": ["สัญญา", "เซ็นสัญญา", "ข้อตกลง"],
         "visa": ["วีซ่า", "visa", "เอกสาร"],
-        "unknown": ["ทีมจะติดต่อกลับ", "ทีมงานจะติดต่อ", "ให้ทีมช่วย", "ติดต่อกลับไปเร็วๆ"]
+        "unknown": ["ทีมจะติดต่อกลับ", "ทีมงานจะติดต่อ", "ให้ทีมช่วย", "ติดต่อกลับไปเร็วๆ", "โทรมาหาทีม"]
     }
     
     bot_reply_lower = bot_reply.lower()
@@ -412,7 +449,7 @@ def health():
         "bot": "พี่เจนนี่",
         "forwarding": "active" if ZOHO_WEBHOOK_URL else "not configured",
         "claude": "active" if ANTHROPIC_API_KEY else "not configured",
-        "team_notifications": "active" if LINE_TEAM_ACCESS_TOKEN else "not configured",
+        "email_notifications": "active" if TEAM_EMAIL_ADDRESSES and SENDER_EMAIL else "not configured",
         "mode": "forwarding_only" if FORWARDING_ONLY else "full"
     }
 
