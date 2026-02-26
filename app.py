@@ -2,7 +2,7 @@
 # Peyton & Charmed - LINE OA Router Server
 # Routes messages to BOTH Zoho (unchanged) AND Claude (พี่เจนนี่)
 # ============================================================
-
+# Updated for paid plan SMTP - Feb 26, 2026
 import os
 import json
 import hashlib
