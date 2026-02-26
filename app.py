@@ -30,6 +30,9 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ZOHO_WEBHOOK_URL = os.environ.get("ZOHO_WEBHOOK_URL", "")
 
+# Team notifications: Access token for separate LINE OA used for team alerts
+LINE_TEAM_ACCESS_TOKEN = os.environ.get("LINE_TEAM_ACCESS_TOKEN", "")
+
 # Optional: Set to "true" to disable Claude replies (forwarding only)
 FORWARDING_ONLY = os.environ.get("FORWARDING_ONLY", "false").lower() == "true"
 
@@ -142,6 +145,75 @@ def reply_to_line(reply_token, text):
         logger.error(f"Failed to reply on LINE: {e}")
 
 # ============================================================
+# TEAM NOTIFICATION
+# ============================================================
+def send_team_notification(user_message, handoff_reason):
+    """Send notification to team LINE OA when handoff is triggered."""
+    if not LINE_TEAM_ACCESS_TOKEN:
+        logger.warning("LINE_TEAM_ACCESS_TOKEN not set, skipping team notification")
+        return
+
+    # Determine topic emoji based on handoff reason
+    topic_emojis = {
+        "booking": "📋 เรื่อง: การจอง",
+        "payment": "💳 เรื่อง: การชำระเงิน", 
+        "contract": "📄 เรื่อง: สัญญา",
+        "visa": "📘 เรื่อง: วีซ่า",
+        "unknown": "❓ เรื่อง: อื่นๆ"
+    }
+    
+    topic = topic_emojis.get(handoff_reason, "❓ เรื่อง: อื่นๆ")
+    
+    # Truncate message if too long
+    if len(user_message) > 100:
+        user_message = user_message[:100] + "..."
+    
+    notification_text = (
+        f"🔔 ลูกค้าต้องการทีมช่วย\n"
+        f"{topic}\n"
+        f"💬 \"{user_message}\""
+    )
+
+    url = "https://api.line.me/v2/bot/message/broadcast"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_TEAM_ACCESS_TOKEN}"
+    }
+    data = {
+        "messages": [{"type": "text", "text": notification_text}]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        logger.info(f"Team notification sent: status {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"Team notification error: {response.text}")
+    except Exception as e:
+        logger.error(f"Failed to send team notification: {e}")
+
+def detect_handoff_trigger(bot_reply):
+    """
+    Detect if bot reply contains handoff trigger phrases.
+    Returns handoff reason if triggered, None otherwise.
+    """
+    handoff_triggers = {
+        "booking": ["จองห้อง", "การจอง", "ทีมจะติดต่อกลับค่ะ"],
+        "payment": ["ชำระเงิน", "การชำระ", "เงินมัดจำ", "ค่าเช่า"],
+        "contract": ["สัญญา", "เซ็นสัญญา", "ข้อตกลง"],
+        "visa": ["วีซ่า", "visa", "เอกสาร"],
+        "unknown": ["ทีมจะติดต่อกลับ", "ทีมงานจะติดต่อ", "ให้ทีมช่วย"]
+    }
+    
+    bot_reply_lower = bot_reply.lower()
+    
+    for reason, triggers in handoff_triggers.items():
+        for trigger in triggers:
+            if trigger in bot_reply_lower:
+                return reason
+    
+    return None
+
+# ============================================================
 # CLAUDE (พี่เจนนี่) - Get AI Response
 # ============================================================
 def get_jenny_reply(user_id, user_message, form_completed=False):
@@ -163,7 +235,7 @@ def get_jenny_reply(user_id, user_message, form_completed=False):
 
     try:
         response = claude_client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-5-20250514",
             max_tokens=500,  # Keep replies concise for chat
             system=system_prompt,
             messages=messages
@@ -282,6 +354,12 @@ def callback():
 
             reply = get_jenny_reply(user_id, user_text, form_completed)
             reply_to_line(reply_token, reply)
+            
+            # Check if this reply triggers a handoff to team
+            handoff_reason = detect_handoff_trigger(reply)
+            if handoff_reason:
+                logger.info(f"Handoff triggered: {handoff_reason}")
+                send_team_notification(user_text, handoff_reason)
 
         elif message_type == "sticker":
             # Sticker - friendly response + nudge form if needed
@@ -334,6 +412,7 @@ def health():
         "bot": "พี่เจนนี่",
         "forwarding": "active" if ZOHO_WEBHOOK_URL else "not configured",
         "claude": "active" if ANTHROPIC_API_KEY else "not configured",
+        "team_notifications": "active" if LINE_TEAM_ACCESS_TOKEN else "not configured",
         "mode": "forwarding_only" if FORWARDING_ONLY else "full"
     }
 
