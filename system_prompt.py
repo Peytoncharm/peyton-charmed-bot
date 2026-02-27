@@ -1,182 +1,475 @@
 # ============================================================
-# พี่เจนนี่ System Prompt
-# Peyton & Charmed - LINE OA Chatbot
-# ============================================================
-# EDIT THIS FILE to update พี่เจนนี่'s knowledge and behavior
-# After editing, redeploy on Render to apply changes
+# Peyton & Charmed - LINE OA Router Server
+# Routes messages to BOTH Zoho (unchanged) AND Claude (พี่เจนนี่)
 # ============================================================
 
-# Replace this with your actual Zoho form URL (base URL without LINE_ID)
-ZOHO_FORM_BASE_URL = "https://zfrmz.eu/18ZI1PkA31pnl6NEYLMi"
+import os
+import json
+import hashlib
+import hmac
+import base64
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta
 
-SYSTEM_PROMPT_MODE_A = """
-คุณคือตัวแทนทีมงาน Peyton & Charmed ที่ช่วยดูแลลูกค้าที่สนใจที่พักนักศึกษาในอังกฤษ
+import requests
+from flask import Flask, request, abort
+import anthropic
 
-═══════════════════════════════════════
-ตัวตนและการสื่อสาร
-═══════════════════════════════════════
-- บุคลิก: อบอุ่น ใจดี เป็นมิตร
-- ใช้ภาษาไทย สุภาพ เป็นกันเอง
-- ใช้ค่ะ/คะ/นะคะ ลงท้าย
-- เรียกลูกค้าว่า "น้อง" หรือใช้ชื่อ
-- ใช้อีโมจิบ้างเล็กน้อย (😊💬👉) แต่ไม่มากเกินไป
+from system_prompt import (
+    SYSTEM_PROMPT_MODE_A,
+    SYSTEM_PROMPT_MODE_B,
+    ZOHO_FORM_BASE_URL,
+)
 
-การอ้างถึงตัวเอง:
-- ใช้ "เรา", "ทีมงาน", หรือ "ฝ่ายบริการ"
-- หลีกเลี่ยงการพูดถึงชื่อบุคคลเฉพาะ
-- เน้นเป็นตัวแทนของ Peyton & Charmed
+# ============================================================
+# CONFIGURATION (Set these in Render Environment Variables)
+# ============================================================
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ZOHO_WEBHOOK_URL = os.environ.get("ZOHO_WEBHOOK_URL", "")
 
-═══════════════════════════════════════
-โหมดปัจจุบัน: FORM NUDGER
-═══════════════════════════════════════
-ลูกค้าคนนี้ยังไม่ได้กรอกแบบฟอร์ม!
+# Team notifications via email
+TEAM_EMAIL_ADDRESSES = os.environ.get("TEAM_EMAIL_ADDRESSES", "")  # Comma-separated emails
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")  # Gmail account for sending
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")  # Gmail app password
+SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = os.environ.get("SMTP_PORT", "587")
 
-เป้าหมายหลัก: สร้างความสัมพันธ์ + ให้ลูกค้ากรอกแบบฟอร์มให้ได้
+# Optional: Set to "true" to disable Claude replies (forwarding only)
+FORWARDING_ONLY = os.environ.get("FORWARDING_ONLY", "false").lower() == "true"
 
-บทบาทของเรา: เหมือน "พนักงานต้อนรับ" — ทักทาย ให้ข้อมูลเบื้องต้น แต่ไม่รับปากหรือตัดสินใจแทนทีม
+# ============================================================
+# SETUP
+# ============================================================
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-กฎ:
-1. ทักทายอบอุ่น แนะนำว่าเป็นทีมงาน Peyton & Charmed
-2. ถ้าลูกค้าถามคำถาม → ตอบสั้นๆ คร่าวๆ แล้วนำกลับไปที่ฟอร์ม
-3. ห้ามส่งลิงก์ฟอร์มทุกข้อความ! ให้เปลี่ยนวิธีพูดเรื่องฟอร์มทุกครั้ง:
-   - ครั้งแรก: ส่งลิงก์ฟอร์มตรงๆ
-   - ครั้งต่อไป: เตือนเบาๆ โดยไม่ต้องส่งลิงก์ซ้ำ เช่น "กรอกฟอร์มที่ส่งไปแล้วก่อนนะคะ จะได้ช่วยน้องได้เต็มที่ค่ะ"
-   - ถ้าลูกค้ายังไม่กรอก: ตอบคำถามคร่าวๆ ไปก่อน แต่เน้นว่า "รายละเอียดเต็มๆ ต้องรอกรอกฟอร์มก่อนนะคะ"
-   - ห้ามพูดประโยคเดิมซ้ำ ต้องเปลี่ยนคำพูดทุกครั้ง
-4. อธิบายว่าทำไมฟอร์มถึงสำคัญ: "จะได้แนะนำห้องที่เหมาะกับน้องโดยเฉพาะ"
-5. ห้ามตอบรายละเอียดมากเกินไปก่อนกรอกฟอร์ม (ให้แค่ข้อมูลพอหอมปากหอมคอ)
-6. ห้ามพูดว่า "ได้เลยค่ะ" หรือ "เราช่วยได้ค่ะ" ถ้ายังไม่รู้รายละเอียดของลูกค้า
-7. ถ้าลูกค้าถามเรื่องเฉพาะเจาะจง → บอกตรงๆ ว่า "ขึ้นอยู่กับหลายปัจจัย เช่น ความต้องการ งบประมาณ ช่วงเวลา กรอกฟอร์มให้เราก่อนนะคะ จะได้ดูให้ตรงจุดเลยค่ะ"
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-ตัวอย่างวิธีพูดเรื่องฟอร์ม (ห้ามใช้แบบเดิมซ้ำ):
-- ข้อความแรก: "รบกวนน้องกรอกแบบฟอร์มสั้นๆ นี้ให้เราก่อนนะคะ จะได้แนะนำได้ตรงเลยค่ะ 👉 {form_link}"
-- ข้อความต่อมา: "กรอกฟอร์มที่ส่งไปก่อนนะคะ แป๊บเดียวค่ะ 😊"
-- ข้อความต่อมา: "ตอบคร่าวๆ ได้ค่ะ แต่ถ้าน้องกรอกฟอร์มแล้ว ทีมจะช่วยดูให้ละเอียดกว่านี้ได้เลยนะคะ"
-- ข้อความต่อมา: (ตอบคำถามไปก่อน ไม่ต้องพูดเรื่องฟอร์มทุกข้อความ)
+# ============================================================
+# CONVERSATION MEMORY
+# Stores recent messages per user for natural conversation flow
+# ============================================================
+conversation_history = defaultdict(list)
+MAX_HISTORY = 10  # Remember last 10 messages per user
 
-ถ้าลูกค้าส่งสติกเกอร์หรือรูป:
-- ข้อความแรก: "น่ารักค่ะ 😊 ทีมงานยินดีช่วยเหลือนะคะ กรอกฟอร์มสั้นๆ นี้ให้เราก่อนนะคะ จะได้แนะนำที่พักที่เหมาะกับน้องได้เลยค่ะ 👉 {form_link}"
-- ข้อความต่อไป: "ขอบคุณค่ะ 😊 อย่าลืมกรอกฟอร์มที่ส่งไปก่อนนะคะ จะได้ช่วยน้องได้เลยค่ะ"
+def add_to_history(user_id, role, content):
+    """Add a message to conversation history."""
+    conversation_history[user_id].append({
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now().isoformat()
+    })
+    # Keep only the last MAX_HISTORY messages
+    if len(conversation_history[user_id]) > MAX_HISTORY:
+        conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY:]
 
-═══════════════════════════════════════
-ส่งต่อทีม (Human Handoff) — Mode A
-═══════════════════════════════════════
-ถ้าลูกค้าถามเรื่องต่อไปนี้ ต้องส่งต่อทีมทันที:
-- อยากจอง / พร้อมจอง / ถามขั้นตอนจองละเอียด
-- ถามราคาเฉพาะเจาะจง (ห้อง+เมือง+ช่วงเวลา)
-- เรื่องวีซ่า กฎหมาย สัญญา
-- ข้อร้องเรียน หรือไม่พอใจ
-- ลูกค้าขอคุยกับคน / ขอโทรหา
-- คำถามที่ตอบไม่ได้
+def get_history(user_id):
+    """Get conversation history formatted for Claude API."""
+    messages = []
+    for msg in conversation_history[user_id]:
+        messages.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+    return messages
 
-วิธีส่งต่อ:
-1. ตอบลูกค้าอย่างอบอุ่น + บอกว่าทีมจะติดต่อกลับ
-2. ใส่ [HANDOFF] ไว้ท้ายข้อความเสมอ (ระบบจะแจ้งทีมอัตโนมัติ)
+def clean_old_histories():
+    """Remove conversation histories older than 24 hours."""
+    cutoff = datetime.now() - timedelta(hours=24)
+    users_to_remove = []
+    for user_id, messages in conversation_history.items():
+        if messages and datetime.fromisoformat(messages[-1]["timestamp"]) < cutoff:
+            users_to_remove.append(user_id)
+    for user_id in users_to_remove:
+        del conversation_history[user_id]
 
-ตัวอย่าง:
-"เรื่องนี้ขอให้ทีมช่วยดูแลน้องโดยเฉพาะนะคะ จะมีทีมติดต่อกลับเร็วๆ นี้เลยค่ะ 😊 [HANDOFF]"
+# ============================================================
+# LINE SIGNATURE VERIFICATION
+# ============================================================
+def verify_signature(body, signature):
+    """Verify that the request is from LINE."""
+    hash_value = hmac.new(
+        LINE_CHANNEL_SECRET.encode("utf-8"),
+        body.encode("utf-8"),
+        hashlib.sha256
+    ).digest()
+    expected_signature = base64.b64encode(hash_value).decode("utf-8")
+    return hmac.compare_digest(signature, expected_signature)
 
-สำคัญ: ทุกครั้งที่บอกลูกค้าว่า "ทีมจะติดต่อกลับ" ต้องใส่ [HANDOFF] ด้วยเสมอ ห้ามลืม!
+# ============================================================
+# ZOHO FORWARDING
+# ============================================================
+def forward_to_zoho(body, headers):
+    """Forward the raw LINE webhook data to Zoho (keeps existing integration alive)."""
+    if not ZOHO_WEBHOOK_URL:
+        logger.warning("ZOHO_WEBHOOK_URL not set, skipping Zoho forwarding")
+        return
 
-ห้ามทำ:
-- ห้ามบอกว่าเป็น AI หรือ chatbot
-- ห้ามตอบรายละเอียดราคาเต็ม (ให้คร่าวๆ พอ)
-- ห้ามสร้างข้อมูลที่ไม่จริง
-- ห้ามตอบเรื่องวีซ่า กฎหมาย หรือเรื่องที่ไม่เกี่ยวกับที่พัก
-""".strip()
+    try:
+        # Forward with relevant headers
+        forward_headers = {
+            "Content-Type": headers.get("Content-Type", "application/json"),
+            "X-Line-Signature": headers.get("X-Line-Signature", ""),
+        }
+        response = requests.post(
+            ZOHO_WEBHOOK_URL,
+            data=body,
+            headers=forward_headers,
+            timeout=10
+        )
+        logger.info(f"Forwarded to Zoho: status {response.status_code}")
+    except Exception as e:
+        logger.error(f"Failed to forward to Zoho: {e}")
+        # Don't raise - we don't want Zoho issues to block LINE replies
 
+# ============================================================
+# LINE REPLY
+# ============================================================
+def reply_to_line(reply_token, text):
+    """Send a reply message to LINE."""
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
+    }
+    data = {
+        "replyToken": reply_token,
+        "messages": [{"type": "text", "text": text}]
+    }
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        logger.info(f"LINE reply: status {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"LINE reply error: {response.text}")
+    except Exception as e:
+        logger.error(f"Failed to reply on LINE: {e}")
 
-SYSTEM_PROMPT_MODE_B = """
-คุณคือตัวแทนทีมงาน Peyton & Charmed ที่ช่วยดูแลลูกค้าที่สนใจที่พักนักศึกษาในอังกฤษ
+# ============================================================
+# TEAM NOTIFICATION (EMAIL)
+# ============================================================
+def send_team_notification(user_message, handoff_reason):
+    """Send email notification to team when handoff is triggered."""
+    
+    # Get team email addresses from environment variable
+    team_emails = os.environ.get("TEAM_EMAIL_ADDRESSES", "").split(",")
+    team_emails = [email.strip() for email in team_emails if email.strip()]
+    
+    if not team_emails:
+        logger.warning("TEAM_EMAIL_ADDRESSES not set, skipping team notification")
+        return
 
-═══════════════════════════════════════
-ตัวตนและการสื่อสาร
-═══════════════════════════════════════
-- บุคลิก: อบอุ่น ใจดี เป็นมิตร
-- ใช้ภาษาไทย สุภาพ เป็นกันเอง
-- ใช้ค่ะ/คะ/นะคะ ลงท้าย
-- เรียกลูกค้าว่า "น้อง" หรือใช้ชื่อ
-- ใช้อีโมจิบ้างเล็กน้อย (😊💬👉) แต่ไม่มากเกินไป
+    # Determine topic based on handoff reason
+    topic_subjects = {
+        "booking": "🏠 New Booking Request",
+        "payment": "💳 Payment Inquiry", 
+        "contract": "📄 Contract Question",
+        "visa": "📘 Visa Support Request",
+        "unknown": "❓ Customer Needs Help"
+    }
+    
+    subject = topic_subjects.get(handoff_reason, "❓ Customer Needs Help")
+    
+    # Truncate message if too long
+    if len(user_message) > 200:
+        user_message = user_message[:200] + "..."
+    
+    # Create email content
+    email_body = f"""
+A customer needs team assistance:
 
-การอ้างถึงตัวเอง:
-- ใช้ "เรา", "ทีมงาน", หรือ "ฝ่ายบริการ"  
-- หลีกเลี่ยงการพูดถึงชื่อบุคคลเฉพาะ
-- เน้นเป็นตัวแทนของ Peyton & Charmed
+Topic: {handoff_reason.title()}
+Customer Message: "{user_message}"
 
-═══════════════════════════════════════
-โหมดปัจจุบัน: FULL FAQ HELPER
-═══════════════════════════════════════
-ลูกค้าคนนี้กรอกแบบฟอร์มแล้ว! ตอบคำถามทั่วไปได้ แต่ห้ามรับปากเรื่องเฉพาะเจาะจง
+Please check Zoho CRM for full customer details and follow up accordingly.
 
-บทบาทของเรา: เหมือน "พนักงานต้อนรับ" — ให้ข้อมูลทั่วไป รวบรวมความต้องการ แล้วส่งต่อให้ทีมดูแล ไม่ใช่คนตัดสินใจหรือรับปากแทนทีม
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-═══════════════════════════════════════
-กฎสำคัญ: ห้ามมั่นใจเกินไป
-═══════════════════════════════════════
-- ห้ามพูดว่า "ได้เลยค่ะ" "ไม่มีปัญหาค่ะ" "เราจัดให้ได้ค่ะ" ถ้าเรื่องนั้นต้องเช็คก่อน
-- ที่พักแต่ละคนไม่เหมือนกัน ขึ้นอยู่กับ: ความต้องการ งบประมาณ ความพร้อม สถานการณ์ ช่วงเวลา เมือง และห้องว่าง
-- ถ้าลูกค้าถามเรื่องเฉพาะเจาะจง → ตอบว่า "ขึ้นอยู่กับหลายปัจจัยค่ะ เดี๋ยวทีมจะช่วยดูให้ตรงกับสถานการณ์ของน้องเลยนะคะ" + ใส่ [HANDOFF]
-- ให้ข้อมูลทั่วไปได้ แต่ต้องบอกเสมอว่า "รายละเอียดอาจแตกต่างกัน ขึ้นอยู่กับสถานการณ์ของแต่ละคนค่ะ"
+---
+Peyton & Charmed Bot Alert System
+"""
 
-กฎทั่วไป:
-1. ตอบคำถามอย่างเป็นมิตรและให้ข้อมูลทั่วไป
-2. ใช้ข้อมูลจากด้านล่างเท่านั้น ห้ามสร้างข้อมูลเอง
-3. ถ้าไม่รู้คำตอบ → บอกตรงๆ ว่า "เราขอเช็คให้ก่อนนะคะ ทีมงานจะติดต่อกลับค่ะ [HANDOFF]"
-4. ถ้าเรื่องจอง/ชำระเงิน/สัญญา → ส่งต่อทีม: "เรื่องนี้ขอให้ทีมดูแลโดยเฉพาะนะคะ จะมีทีมติดต่อกลับเร็วๆ นี้ค่ะ [HANDOFF]"
-5. เมื่อตอบราคาหรือตัวเลือก ต้องเน้นเสมอว่าเป็น "ข้อมูลเบื้องต้น" และ "อาจเปลี่ยนแปลงได้"
+    # Send email via simple SMTP (using Gmail SMTP as example)
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        
+        # Email configuration from environment variables
+        smtp_server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        sender_email = os.environ.get("SENDER_EMAIL", "")
+        sender_password = os.environ.get("SENDER_PASSWORD", "")
+        
+        if not sender_email or not sender_password:
+            logger.warning("Email credentials not configured, skipping notification")
+            return
+        
+        # Create message
+        message = MIMEMultipart()
+        message["From"] = sender_email
+        message["To"] = ", ".join(team_emails)
+        message["Subject"] = subject
+        message.attach(MIMEText(email_body, "plain"))
+        
+        # Send email
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        text = message.as_string()
+        server.sendmail(sender_email, team_emails, text)
+        server.quit()
+        
+        logger.info(f"Team notification email sent to {len(team_emails)} recipients")
+        
+    except Exception as e:
+        logger.error(f"Failed to send team notification email: {e}")
 
-═══════════════════════════════════════
-ข้อมูลที่ทีมงานตอบได้ (FAQ)
-═══════════════════════════════════════
+def detect_handoff_trigger(bot_reply):
+    """
+    Detect if bot reply contains [HANDOFF] tag.
+    Returns True if handoff is needed, False otherwise.
+    """
+    return "[HANDOFF]" in bot_reply
 
-[*** ใส่ข้อมูล FAQ จากเอกสารเทรนนิ่งของคุณตรงนี้ ***]
-[*** เช่น ประเภทห้อง, ราคา, เมืองที่มี, ขั้นตอนการจอง ***]
-[*** คัดลอกจาก jenny-bot-training-v1 และ jenny-thai-faq ***]
+def strip_handoff_tag(bot_reply):
+    """
+    Remove [HANDOFF] tag from bot reply before sending to customer.
+    Customer should never see this tag.
+    """
+    return bot_reply.replace("[HANDOFF]", "").strip()
 
-ตัวอย่าง (แก้ไขตามข้อมูลจริง):
-- ประเภทห้อง: Studio, En-suite, Shared
-- ราคาเริ่มต้น: ประมาณ xxx ปอนด์/สัปดาห์ (ขึ้นอยู่กับเมืองและประเภทห้อง)
-- เมืองที่มี: London, Manchester, Birmingham, etc.
-- ขั้นตอน: สอบถาม → กรอกฟอร์ม → เลือกห้อง → จอง → ชำระเงิน
+# ============================================================
+# CLAUDE (พี่เจนนี่) - Get AI Response
+# ============================================================
+def get_jenny_reply(user_id, user_message, form_completed=False):
+    """Get a reply from Claude as พี่เจนนี่."""
 
-═══════════════════════════════════════
-ส่งต่อทีม (Human Handoff) — Mode B
-═══════════════════════════════════════
-ต้องส่งต่อทีมทันทีเมื่อ:
-- การจองห้อง / ยืนยันการจอง
-- การชำระเงิน / มัดจำ
-- สัญญาเช่า / เอกสาร
-- วีซ่า / กฎหมาย
-- ข้อร้องเรียน หรือลูกค้าไม่พอใจ
-- ลูกค้าขอคุยกับคน / ขอโทรหา
-- ลูกค้าต้องการข้อมูลเฉพาะที่ขึ้นอยู่กับสถานการณ์ส่วนตัว
-- คำถามที่ทีมงานไม่รู้คำตอบ
-- ลูกค้าถามคำถามเดิมซ้ำ (อาจไม่พอใจกับคำตอบ)
-- ลูกค้าพร้อมตัดสินใจ / พูดว่า "เอาเลย" "สนใจ" "จองเลย"
+    # Choose system prompt based on form status
+    if form_completed:
+        system_prompt = SYSTEM_PROMPT_MODE_B
+    else:
+        # Insert the form link into Mode A prompt
+        form_link = f"{ZOHO_FORM_BASE_URL}?Line_ID={user_id}"
+        system_prompt = SYSTEM_PROMPT_MODE_A.replace("{form_link}", form_link)
 
-วิธีส่งต่อ:
-1. ตอบลูกค้าอย่างอบอุ่น + บอกว่าทีมจะติดต่อกลับ
-2. ใส่ [HANDOFF] ไว้ท้ายข้อความเสมอ (ระบบจะแจ้งทีมอัตโนมัติ)
+    # Add user message to history
+    add_to_history(user_id, "user", user_message)
 
-ตัวอย่าง:
-- "เรื่องนี้ขอให้ทีมช่วยดูแลน้องโดยเฉพาะนะคะ จะมีทีมติดต่อกลับเร็วๆ นี้เลยค่ะ 😊 [HANDOFF]"
-- "รายละเอียดส่วนนี้ขึ้นอยู่กับสถานการณ์ของน้องค่ะ เดี๋ยวทีมจะติดต่อไปช่วยดูให้เลยนะคะ 😊 [HANDOFF]"
-- "ดีใจที่น้องสนใจค่ะ! เดี๋ยวทีมจะติดต่อน้องเพื่อดูรายละเอียดที่เหมาะกับน้องเลยนะคะ 😊 [HANDOFF]"
+    # Get conversation history
+    messages = get_history(user_id)
 
-สำคัญมาก: 
-- ทุกครั้งที่บอกลูกค้าว่า "ทีมจะติดต่อกลับ" หรือ "ขอเช็คให้" ต้องใส่ [HANDOFF] ด้วยเสมอ ห้ามลืม!
-- ถ้าไม่แน่ใจว่าควรตอบเองหรือส่งต่อ → ให้ส่งต่อเสมอ (ส่งต่อเยอะไปดีกว่าพลาด)
+    try:
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,  # Keep replies concise for chat
+            system=system_prompt,
+            messages=messages
+        )
+        reply = response.content[0].text
 
-═══════════════════════════════════════
-ห้ามทำ
-═══════════════════════════════════════
-- ห้ามบอกว่าเป็น AI หรือ chatbot
-- ห้ามสร้างข้อมูลที่ไม่จริง
-- ห้ามให้คำแนะนำเรื่องวีซ่าหรือกฎหมาย
-- ห้ามรับจองหรือยืนยันราคาโดยไม่ผ่านทีม
-- ห้ามพูดถึงคู่แข่ง
-- ห้ามตอบเรื่องที่ไม่เกี่ยวกับที่พักนักศึกษา
-- ห้ามพูดว่า "ได้เลยค่ะ" "ไม่มีปัญหา" "จัดให้ได้" ถ้าเรื่องนั้นต้องเช็คกับทีมก่อน
-- ห้ามรับปากว่ามีห้องว่าง หรือการันตีราคา
-- ห้ามทำให้ลูกค้ารู้สึกว่าทุกอย่างง่ายหรือสำเร็จรูป — ทุกคนมีสถานการณ์ต่างกัน
-""".strip()
+        # Add assistant reply to history
+        add_to_history(user_id, "assistant", reply)
+
+        return reply
+
+    except Exception as e:
+        logger.error(f"Claude API error: {e}")
+        return "ขอโทษนะคะ ระบบมีปัญหาทางเทคนิคค่ะ ทีมจะติดต่อกลับเร็วๆ นี้นะคะ 🙏 [HANDOFF]"
+
+# ============================================================
+# FORM STATUS CHECK
+# ============================================================
+def check_form_completed(user_id):
+    """
+    Check if this LINE user has completed the Zoho form.
+
+    TODO: Replace this with actual Zoho CRM API call.
+    For now, defaults to False (Mode A: Form Nudger).
+
+    To implement:
+    1. Set up Zoho CRM API OAuth2 credentials
+    2. Search Zoho CRM contacts/leads by LINE_ID custom field
+    3. Check if lead exists and has form_completed = true
+
+    Example Zoho API call:
+        GET https://www.zohoapis.com/crm/v2/Leads/search?criteria=(LINE_ID:equals:{user_id})
+    """
+    # ============================================================
+    # PHASE 1: Always use Mode A (Form Nudger)
+    # This is safe - พี่เจนนี่ will always nudge for form completion
+    #
+    # PHASE 2: Uncomment below to check Zoho CRM
+    # ============================================================
+
+    # PHASE 2 (uncomment when ready):
+    # try:
+    #     zoho_token = get_zoho_access_token()
+    #     headers = {"Authorization": f"Zoho-oauthtoken {zoho_token}"}
+    #     url = f"https://www.zohoapis.com/crm/v2/Leads/search?criteria=(LINE_ID:equals:{user_id})"
+    #     response = requests.get(url, headers=headers, timeout=5)
+    #     if response.status_code == 200:
+    #         data = response.json()
+    #         if data.get("data"):
+    #             # Lead exists = form was completed
+    #             return True
+    #     return False
+    # except Exception as e:
+    #     logger.error(f"Zoho check failed: {e}")
+    #     return False
+
+    return False  # Default: assume form not completed (Mode A)
+
+# ============================================================
+# MAIN WEBHOOK ENDPOINT
+# ============================================================
+@app.route("/callback", methods=["POST"])
+def callback():
+    """Main webhook endpoint - receives all LINE events."""
+
+    # Get request data
+    signature = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+
+    # Verify signature
+    if not verify_signature(body, signature):
+        logger.warning("Invalid signature")
+        abort(400)
+
+    # ============================================================
+    # STEP 1: Forward EVERYTHING to Zoho (keeps existing flow alive)
+    # ============================================================
+    forward_to_zoho(body, dict(request.headers))
+
+    # ============================================================
+    # STEP 2: Process with Claude (พี่เจนนี่) if applicable
+    # ============================================================
+    if FORWARDING_ONLY:
+        logger.info("Forwarding only mode - skipping Claude")
+        return "OK"
+
+    try:
+        events = json.loads(body).get("events", [])
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON body")
+        return "OK"
+
+    for event in events:
+        # Only process message events from users
+        if event.get("type") != "message":
+            continue
+
+        reply_token = event.get("replyToken", "")
+        user_id = event.get("source", {}).get("userId", "")
+        message = event.get("message", {})
+        message_type = message.get("type", "")
+
+        if not reply_token or not user_id:
+            continue
+
+        # Clean old conversation histories periodically
+        clean_old_histories()
+
+        # Check if form has been completed
+        form_completed = check_form_completed(user_id)
+
+        if message_type == "text":
+            # Text message - get Claude reply
+            user_text = message.get("text", "")
+            logger.info(f"User {user_id}: {user_text[:50]}...")
+
+            reply = get_jenny_reply(user_id, user_text, form_completed)
+            
+            # Check if this reply triggers a handoff to team
+            if detect_handoff_trigger(reply):
+                logger.info(f"Handoff triggered for user {user_id}")
+                send_team_notification(user_text, "customer_needs_help")
+            
+            # Strip [HANDOFF] tag before sending to customer
+            clean_reply = strip_handoff_tag(reply)
+            reply_to_line(reply_token, clean_reply)
+
+        elif message_type == "sticker":
+            # Sticker - friendly response + nudge form if needed
+            if form_completed:
+                reply = "น่ารักค่ะ 😊 มีอะไรให้ช่วยไหมคะ?"
+            else:
+                form_link = f"{ZOHO_FORM_BASE_URL}?Line_ID={user_id}"
+                reply = (
+                    f"น่ารักค่ะ 😊 ทีมงานยินดีช่วยเหลือนะคะ "
+                    f"กรอกฟอร์มสั้นๆ นี้ให้เราก่อนนะคะ "
+                    f"จะได้แนะนำที่พักที่เหมาะกับน้องได้เลยค่ะ 👉 {form_link}"
+                )
+            reply_to_line(reply_token, reply)
+
+        elif message_type == "image":
+            # Image - acknowledge
+            if form_completed:
+                reply = "ได้รับรูปแล้วค่ะ 😊 มีอะไรให้ช่วยดูไหมคะ?"
+            else:
+                form_link = f"{ZOHO_FORM_BASE_URL}?Line_ID={user_id}"
+                reply = (
+                    f"ได้รับรูปแล้วค่ะ 😊 ทีมงานดูรูปไม่ได้ "
+                    f"แต่ยินดีช่วยเหลือเรื่องที่พักนะคะ "
+                    f"รบกวนกรอกฟอร์มนี้ให้เราก่อนนะคะ 👉 {form_link}"
+                )
+            reply_to_line(reply_token, reply)
+
+        elif message_type in ("audio", "video", "file"):
+            # Voice/Video/File - acknowledge
+            reply = (
+                "ได้รับแล้วค่ะ 😊 ทีมงานตอบได้ทางข้อความนะคะ "
+                "พิมพ์คำถามมาได้เลยค่ะ ยินดีช่วยเหลือค่ะ 💬"
+            )
+            reply_to_line(reply_token, reply)
+
+        else:
+            # Unknown message type - ignore
+            logger.info(f"Ignoring message type: {message_type}")
+
+    return "OK"
+
+# ============================================================
+# HEALTH CHECK ENDPOINT
+# ============================================================
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint for monitoring."""
+    return {
+        "status": "ok",
+        "bot": "Peyton & Charmed Team Bot",
+        "forwarding": "active" if ZOHO_WEBHOOK_URL else "not configured",
+        "claude": "active" if ANTHROPIC_API_KEY else "not configured",
+        "email_notifications": "active" if TEAM_EMAIL_ADDRESSES and SENDER_EMAIL else "not configured",
+        "mode": "forwarding_only" if FORWARDING_ONLY else "full"
+    }
+
+# ============================================================
+# SAFETY MODE ENDPOINT
+# ============================================================
+@app.route("/safety/forwarding-only", methods=["POST"])
+def enable_forwarding_only():
+    """Emergency: disable Claude replies, keep Zoho forwarding."""
+    global FORWARDING_ONLY
+    FORWARDING_ONLY = True
+    return {"status": "forwarding_only_enabled", "claude_replies": "disabled"}
+
+@app.route("/safety/full-mode", methods=["POST"])
+def enable_full_mode():
+    """Re-enable Claude replies."""
+    global FORWARDING_ONLY
+    FORWARDING_ONLY = False
+    return {"status": "full_mode_enabled", "claude_replies": "enabled"}
+
+# ============================================================
+# RUN
+# ============================================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    logger.info(f"Starting Peyton & Charmed Bot on port {port}")
+    logger.info(f"Zoho forwarding: {'active' if ZOHO_WEBHOOK_URL else 'NOT CONFIGURED'}")
+    logger.info(f"Claude replies: {'disabled' if FORWARDING_ONLY else 'active'}")
+    app.run(host="0.0.0.0", port=port)
