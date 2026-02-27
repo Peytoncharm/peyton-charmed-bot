@@ -436,6 +436,10 @@ def callback():
             # Regular text message - get Claude reply
             reply = get_jenny_reply(user_id, user_text, form_completed)
 
+            # If Claude's reply contains the form link, mark it as sent
+            if ZOHO_FORM_BASE_URL in reply:
+                mark_form_link_sent(user_id)
+
             # Check if this reply triggers a handoff to team
             if detect_handoff_trigger(reply):
                 logger.info(f"Handoff triggered for user {user_id}")
@@ -446,23 +450,9 @@ def callback():
             reply_to_line(reply_token, clean_reply)
 
         elif message_type == "sticker":
-            # ============================================================
-            # STICKER: Only nudge form if NOT completed AND not sent yet
-            # ============================================================
-            if form_completed:
-                reply = "น่ารักค่ะ 😊 มีอะไรให้ช่วยไหมคะ?"
-            elif has_form_link_been_sent(user_id):
-                # Form link already sent before, don't send again
-                reply = "น่ารักค่ะ 😊 กรอกฟอร์มเสร็จแล้วบอกพี่ด้วยนะคะ จะได้ช่วยน้องต่อได้เลยค่ะ"
-            else:
-                form_link = f"{ZOHO_FORM_BASE_URL}?Line_ID={user_id}"
-                reply = (
-                    f"น่ารักค่ะ 😊 ทีมงานยินดีช่วยเหลือนะคะ "
-                    f"กรอกฟอร์มสั้นๆ นี้ให้เราก่อนนะคะ "
-                    f"จะได้แนะนำที่พักที่เหมาะกับน้องได้เลยค่ะ 👉 {form_link}"
-                )
-                mark_form_link_sent(user_id)
-            reply_to_line(reply_token, reply)
+            # Ignore stickers - no reply needed
+            logger.info(f"Sticker from {user_id} - ignoring")
+            continue
 
         elif message_type == "image":
             if form_completed:
