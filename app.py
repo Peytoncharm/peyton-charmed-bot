@@ -2,7 +2,7 @@
 # Peyton & Charmed - LINE OA Router Server
 # Routes messages to BOTH Zoho (unchanged) AND Claude (พี่เจนนี่)
 # ============================================================
-# Updated: Form completion tracking + HANDOFF fix + sticker fix
+# Updated: PERSISTENT form tracking (survives server restarts)
 
 import os
 import json
@@ -53,30 +53,64 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # ============================================================
 # CONVERSATION MEMORY
 # Stores recent messages per user for natural conversation flow
+# (This can be in-memory since it's just for current chat context)
 # ============================================================
 conversation_history = defaultdict(list)
 MAX_HISTORY = 10
 
 # ============================================================
-# FORM TRACKING
-# Remembers which users have completed the form
-# and which users have already been sent the form link
+# PERSISTENT FORM TRACKING (SAVED TO FILE)
+# This is the KEY FIX - data survives server restarts!
 # ============================================================
-form_completed_users = set()
-form_link_sent_users = set()
+FORM_DATA_FILE = "/opt/render/project/src/form_tracking.json"
+
+def load_form_data():
+    """Load form tracking data from file."""
+    try:
+        if os.path.exists(FORM_DATA_FILE):
+            with open(FORM_DATA_FILE, "r") as f:
+                data = json.load(f)
+                logger.info(f"Loaded form data: {len(data.get('completed', []))} completed, {len(data.get('link_sent', []))} link sent")
+                return data
+    except Exception as e:
+        logger.error(f"Error loading form data: {e}")
+    
+    # Return empty data if file doesn't exist or has errors
+    return {"completed": [], "link_sent": []}
+
+def save_form_data():
+    """Save form tracking data to file."""
+    try:
+        data = {
+            "completed": list(form_completed_users),
+            "link_sent": list(form_link_sent_users),
+        }
+        with open(FORM_DATA_FILE, "w") as f:
+            json.dump(data, f)
+        logger.info(f"Saved form data: {len(form_completed_users)} completed, {len(form_link_sent_users)} link sent")
+    except Exception as e:
+        logger.error(f"Error saving form data: {e}")
+
+# Load saved data when server starts
+_saved_data = load_form_data()
+form_completed_users = set(_saved_data.get("completed", []))
+form_link_sent_users = set(_saved_data.get("link_sent", []))
+logger.info(f"Restored: {len(form_completed_users)} completed users, {len(form_link_sent_users)} link-sent users")
 
 def mark_form_completed(user_id):
-    """Mark a user as having completed the form."""
+    """Mark a user as having completed the form (and save to file)."""
     form_completed_users.add(user_id)
-    logger.info(f"User {user_id} marked as form completed")
+    save_form_data()
+    logger.info(f"User {user_id} marked as form completed (saved)")
 
 def has_form_been_completed(user_id):
     """Check if user has told us they completed the form."""
     return user_id in form_completed_users
 
 def mark_form_link_sent(user_id):
-    """Mark that we already sent the form link to this user."""
+    """Mark that we already sent the form link to this user (and save to file)."""
     form_link_sent_users.add(user_id)
+    save_form_data()
 
 def has_form_link_been_sent(user_id):
     """Check if we already sent the form link to this user."""
@@ -114,6 +148,8 @@ def check_if_user_says_form_done(user_message):
         "กรอกฟอร์มแล้ว",
         "กรอกฟอร์มเรียบร้อย",
         "กรอกฟอร์มเสร็จ",
+        "กรอกแล้วครับ",
+        "กรอกแล้วค่ะ",
         # English phrases
         "done",
         "completed",
@@ -163,7 +199,10 @@ def get_history(user_id):
     return messages
 
 def clean_old_histories():
-    """Remove conversation histories older than 24 hours."""
+    """Remove conversation histories older than 24 hours.
+    NOTE: We do NOT remove form tracking data anymore!
+    Form tracking is permanent so returning customers are remembered.
+    """
     cutoff = datetime.now() - timedelta(hours=24)
     users_to_remove = []
     for user_id, messages in conversation_history.items():
@@ -171,9 +210,7 @@ def clean_old_histories():
             users_to_remove.append(user_id)
     for user_id in users_to_remove:
         del conversation_history[user_id]
-        # Also clean up form tracking for old users
-        form_completed_users.discard(user_id)
-        form_link_sent_users.discard(user_id)
+        # DO NOT remove form tracking - we want to remember customers forever!
 
 # ============================================================
 # LINE SIGNATURE VERIFICATION
@@ -399,8 +436,7 @@ def callback():
         clean_old_histories()
 
         # ============================================================
-        # CHECK FORM STATUS
-        # Uses our tracking (did user say "done"?)
+        # CHECK FORM STATUS (now reads from PERSISTENT file storage)
         # ============================================================
         form_completed = has_form_been_completed(user_id)
 
@@ -494,7 +530,8 @@ def health():
         "claude": "active" if ANTHROPIC_API_KEY else "not configured",
         "email_notifications": "active" if TEAM_EMAIL_ADDRESSES and SENDER_EMAIL else "not configured",
         "mode": "forwarding_only" if FORWARDING_ONLY else "full",
-        "form_completed_users": len(form_completed_users)
+        "form_completed_users": len(form_completed_users),
+        "form_link_sent_users": len(form_link_sent_users)
     }
 
 # ============================================================
@@ -522,4 +559,6 @@ if __name__ == "__main__":
     logger.info(f"Starting Peyton & Charmed Bot on port {port}")
     logger.info(f"Zoho forwarding: {'active' if ZOHO_WEBHOOK_URL else 'NOT CONFIGURED'}")
     logger.info(f"Claude replies: {'disabled' if FORWARDING_ONLY else 'active'}")
+    logger.info(f"Form tracking file: {FORM_DATA_FILE}")
     app.run(host="0.0.0.0", port=port)
+
