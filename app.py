@@ -1,8 +1,8 @@
 # ============================================================
 # Peyton & Charmed - LINE OA Router Server
-# Routes messages to BOTH Zoho (unchanged) AND Claude (พี่เจนนี่)
+# Routes messages to BOTH Zoho (unchanged) AND Claude
 # ============================================================
-# Updated: PERSISTENT form tracking (survives server restarts)
+# Updated: 3-MODE system + PERSISTENT form tracking
 
 import os
 import json
@@ -20,6 +20,7 @@ import anthropic
 from system_prompt import (
     SYSTEM_PROMPT_MODE_A,
     SYSTEM_PROMPT_MODE_B,
+    SYSTEM_PROMPT_MODE_C,
     ZOHO_FORM_BASE_URL,
 )
 
@@ -74,8 +75,6 @@ def load_form_data():
                 return data
     except Exception as e:
         logger.error(f"Error loading form data: {e}")
-    
-    # Return empty data if file doesn't exist or has errors
     return {"completed": [], "link_sent": []}
 
 def save_form_data():
@@ -117,62 +116,27 @@ def has_form_link_been_sent(user_id):
     return user_id in form_link_sent_users
 
 def check_if_user_says_form_done(user_message):
-    """
-    Check if the user's message means they completed the form.
-    Returns True if they say something like 'done', 'completed', etc.
-    """
+    """Check if the user's message means they completed the form."""
     done_phrases = [
-        # Thai phrases
-        "กรอกแล้ว",
-        "กรอกเรียบร้อย",
-        "เรียบร้อยแล้ว",
-        "เรียบร้อยค่ะ",
-        "เรียบร้อยครับ",
-        "กรอกเสร็จ",
-        "ส่งแล้ว",
-        "ส่งฟอร์มแล้ว",
-        "ทำแล้ว",
-        "ทำเสร็จแล้ว",
-        "เสร็จแล้ว",
-        "เสร็จแล้วค่ะ",
-        "เสร็จแล้วครับ",
-        "กรอกเรียบร้อยค่ะ",
-        "กรอกเรียบร้อยครับ",
-        "กรอกเรียบร้อยค่า",
-        "กรอกเรียบร้อยคะ",
-        "ส่งแล้วค่ะ",
-        "ส่งแล้วครับ",
-        "ส่งไปแล้ว",
-        "ทำเรียบร้อย",
-        "เรียบร้อย",
-        "กรอกฟอร์มแล้ว",
-        "กรอกฟอร์มเรียบร้อย",
-        "กรอกฟอร์มเสร็จ",
-        "กรอกแล้วครับ",
-        "กรอกแล้วค่ะ",
-        # English phrases
-        "done",
-        "completed",
-        "finished",
-        "submitted",
-        "filled out",
-        "filled in",
-        "already filled",
-        "already done",
-        "already completed",
-        "i filled",
-        "i completed",
-        "form done",
-        "form completed",
-        "form submitted",
+        "กรอกแล้ว", "กรอกเรียบร้อย", "เรียบร้อยแล้ว",
+        "เรียบร้อยค่ะ", "เรียบร้อยครับ", "กรอกเสร็จ",
+        "ส่งแล้ว", "ส่งฟอร์มแล้ว", "ทำแล้ว",
+        "ทำเสร็จแล้ว", "เสร็จแล้ว", "เสร็จแล้วค่ะ",
+        "เสร็จแล้วครับ", "กรอกเรียบร้อยค่ะ", "กรอกเรียบร้อยครับ",
+        "กรอกเรียบร้อยค่า", "กรอกเรียบร้อยคะ",
+        "ส่งแล้วค่ะ", "ส่งแล้วครับ", "ส่งไปแล้ว",
+        "ทำเรียบร้อย", "เรียบร้อย", "กรอกฟอร์มแล้ว",
+        "กรอกฟอร์มเรียบร้อย", "กรอกฟอร์มเสร็จ",
+        "กรอกแล้วครับ", "กรอกแล้วค่ะ", "กรอกแล้วค่า",
+        "done", "completed", "finished", "submitted",
+        "filled out", "filled in", "already filled",
+        "already done", "already completed", "i filled",
+        "i completed", "form done", "form completed", "form submitted",
     ]
-
     message_lower = user_message.lower().strip()
-
     for phrase in done_phrases:
         if phrase in message_lower:
             return True
-
     return False
 
 # ============================================================
@@ -192,16 +156,12 @@ def get_history(user_id):
     """Get conversation history formatted for Claude API."""
     messages = []
     for msg in conversation_history[user_id]:
-        messages.append({
-            "role": msg["role"],
-            "content": msg["content"]
-        })
+        messages.append({"role": msg["role"], "content": msg["content"]})
     return messages
 
 def clean_old_histories():
     """Remove conversation histories older than 24 hours.
     NOTE: We do NOT remove form tracking data anymore!
-    Form tracking is permanent so returning customers are remembered.
     """
     cutoff = datetime.now() - timedelta(hours=24)
     users_to_remove = []
@@ -210,7 +170,6 @@ def clean_old_histories():
             users_to_remove.append(user_id)
     for user_id in users_to_remove:
         del conversation_history[user_id]
-        # DO NOT remove form tracking - we want to remember customers forever!
 
 # ============================================================
 # LINE SIGNATURE VERIFICATION
@@ -233,18 +192,12 @@ def forward_to_zoho(body, headers):
     if not ZOHO_WEBHOOK_URL:
         logger.warning("ZOHO_WEBHOOK_URL not set, skipping Zoho forwarding")
         return
-
     try:
         forward_headers = {
             "Content-Type": headers.get("Content-Type", "application/json"),
             "X-Line-Signature": headers.get("X-Line-Signature", ""),
         }
-        response = requests.post(
-            ZOHO_WEBHOOK_URL,
-            data=body,
-            headers=forward_headers,
-            timeout=10
-        )
+        response = requests.post(ZOHO_WEBHOOK_URL, data=body, headers=forward_headers, timeout=10)
         logger.info(f"Forwarded to Zoho: status {response.status_code}")
     except Exception as e:
         logger.error(f"Failed to forward to Zoho: {e}")
@@ -259,10 +212,7 @@ def reply_to_line(reply_token, text):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"
     }
-    data = {
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text}]
-    }
+    data = {"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}
     try:
         response = requests.post(url, headers=headers, json=data, timeout=10)
         logger.info(f"LINE reply: status {response.status_code}")
@@ -276,25 +226,21 @@ def reply_to_line(reply_token, text):
 # ============================================================
 def send_team_notification(user_message, handoff_reason):
     """Send email notification to team when handoff is triggered."""
-
     team_emails = os.environ.get("TEAM_EMAIL_ADDRESSES", "").split(",")
     team_emails = [email.strip() for email in team_emails if email.strip()]
-
     if not team_emails:
         logger.warning("TEAM_EMAIL_ADDRESSES not set, skipping team notification")
         return
 
     topic_subjects = {
-        "booking": "🏠 New Booking Request",
-        "payment": "💳 Payment Inquiry",
-        "contract": "📄 Contract Question",
-        "visa": "📘 Visa Support Request",
-        "customer_needs_help": "❓ Customer Needs Help",
-        "unknown": "❓ Customer Needs Help"
+        "booking": "New Booking Request",
+        "payment": "Payment Inquiry",
+        "contract": "Contract Question",
+        "visa": "Visa Support Request",
+        "customer_needs_help": "Customer Needs Help",
+        "unknown": "Customer Needs Help"
     }
-
-    subject = topic_subjects.get(handoff_reason, "❓ Customer Needs Help")
-
+    subject = topic_subjects.get(handoff_reason, "Customer Needs Help")
     if len(user_message) > 200:
         user_message = user_message[:200] + "..."
 
@@ -311,7 +257,6 @@ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ---
 Peyton & Charmed Bot Alert System
 """
-
     try:
         import smtplib
         from email.mime.text import MIMEText
@@ -321,7 +266,6 @@ Peyton & Charmed Bot Alert System
         smtp_port = int(os.environ.get("SMTP_PORT", "587"))
         sender_email = os.environ.get("SENDER_EMAIL", "")
         sender_password = os.environ.get("SENDER_PASSWORD", "")
-
         if not sender_email or not sender_password:
             logger.warning("Email credentials not configured, skipping notification")
             return
@@ -338,9 +282,7 @@ Peyton & Charmed Bot Alert System
         text = message.as_string()
         server.sendmail(sender_email, team_emails, text)
         server.quit()
-
         logger.info(f"Team notification email sent to {len(team_emails)} recipients")
-
     except Exception as e:
         logger.error(f"Failed to send team notification email: {e}")
 
@@ -348,30 +290,38 @@ Peyton & Charmed Bot Alert System
 # HANDOFF DETECTION & CLEANUP
 # ============================================================
 def detect_handoff_trigger(bot_reply):
-    """Detect if bot reply contains [HANDOFF] tag."""
     return "[HANDOFF]" in bot_reply
 
 def strip_handoff_tag(bot_reply):
-    """Remove [HANDOFF] tag before sending to customer."""
     return bot_reply.replace("[HANDOFF]", "").strip()
 
 # ============================================================
-# CLAUDE (พี่เจนนี่) - Get AI Response
+# CLAUDE - Get AI Response (NOW WITH 3 MODES)
 # ============================================================
-def get_jenny_reply(user_id, user_message, form_completed=False):
-    """Get a reply from Claude as พี่เจนนี่."""
+def get_jenny_reply(user_id, user_message, form_completed=False, form_link_sent=False):
+    """Get a reply from Claude.
+    
+    3 MODES:
+    - MODE A: New customer, never got form link -> send form link
+    - MODE C: Customer got form link but hasn't completed -> remind gently, NO link
+    - MODE B: Customer completed form -> full FAQ helper
+    """
 
-    # Choose system prompt based on form status
     if form_completed:
+        # MODE B: Form done, full helper
         system_prompt = SYSTEM_PROMPT_MODE_B
+        logger.info(f"User {user_id}: Using MODE B (form completed)")
+    elif form_link_sent:
+        # MODE C: Form link already sent, just remind
+        system_prompt = SYSTEM_PROMPT_MODE_C
+        logger.info(f"User {user_id}: Using MODE C (waiting for form)")
     else:
+        # MODE A: First time, send form link
         form_link = f"{ZOHO_FORM_BASE_URL}?Line_ID={user_id}"
         system_prompt = SYSTEM_PROMPT_MODE_A.replace("{form_link}", form_link)
+        logger.info(f"User {user_id}: Using MODE A (new customer)")
 
-    # Add user message to history
     add_to_history(user_id, "user", user_message)
-
-    # Get conversation history
     messages = get_history(user_id)
 
     try:
@@ -382,15 +332,11 @@ def get_jenny_reply(user_id, user_message, form_completed=False):
             messages=messages
         )
         reply = response.content[0].text
-
-        # Add assistant reply to history
         add_to_history(user_id, "assistant", reply)
-
         return reply
-
     except Exception as e:
         logger.error(f"Claude API error: {e}")
-        return "ขอโทษนะคะ ระบบมีปัญหาทางเทคนิคค่ะ ทีมจะติดต่อกลับเร็วๆ นี้นะคะ 🙏 [HANDOFF]"
+        return "ขอโทษนะคะ ระบบมีปัญหาทางเทคนิคค่ะ ทีมจะติดต่อกลับเร็วๆ นี้นะคะ [HANDOFF]"
 
 # ============================================================
 # MAIN WEBHOOK ENDPOINT
@@ -398,7 +344,6 @@ def get_jenny_reply(user_id, user_message, form_completed=False):
 @app.route("/callback", methods=["POST"])
 def callback():
     """Main webhook endpoint - receives all LINE events."""
-
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
 
@@ -432,27 +377,24 @@ def callback():
         if not reply_token or not user_id:
             continue
 
-        # Clean old conversation histories periodically
         clean_old_histories()
 
         # ============================================================
-        # CHECK FORM STATUS (now reads from PERSISTENT file storage)
+        # CHECK FORM STATUS (reads from PERSISTENT file storage)
         # ============================================================
         form_completed = has_form_been_completed(user_id)
+        form_link_sent = has_form_link_been_sent(user_id)
 
         if message_type == "text":
             user_text = message.get("text", "")
-            logger.info(f"User {user_id}: {user_text[:50]}...")
+            logger.info(f"User {user_id}: {user_text[:50]}... | completed={form_completed} | link_sent={form_link_sent}")
 
-            # ============================================================
             # CHECK: Did the user just say they completed the form?
-            # ============================================================
             if not form_completed and check_if_user_says_form_done(user_text):
                 mark_form_completed(user_id)
                 form_completed = True
                 logger.info(f"User {user_id} says form is completed!")
 
-                # Send a nice thank you and let them know team will follow up
                 reply = (
                     "ขอบคุณน้องมากค่ะ 😊\n\n"
                     "ทีมงานได้รับข้อมูลจากแบบฟอร์มแล้วค่ะ "
@@ -460,17 +402,13 @@ def callback():
                     "พร้อมกับแนะนำตัวเลือกที่พักที่เหมาะกับความต้องการของน้องโดยเฉพาะเลยนะคะ\n\n"
                     "รอติดต่อกลับไปนะคะ ขอบคุณค่ะ"
                 )
-
-                # Strip any accidental HANDOFF tags
                 clean_reply = strip_handoff_tag(reply)
                 reply_to_line(reply_token, clean_reply)
-
-                # Notify team that form was completed
                 send_team_notification(user_text, "customer_needs_help")
                 continue
 
-            # Regular text message - get Claude reply
-            reply = get_jenny_reply(user_id, user_text, form_completed)
+            # Regular text message - get Claude reply with correct MODE
+            reply = get_jenny_reply(user_id, user_text, form_completed, form_link_sent)
 
             # If Claude's reply contains the form link, mark it as sent
             if ZOHO_FORM_BASE_URL in reply:
@@ -486,21 +424,20 @@ def callback():
             reply_to_line(reply_token, clean_reply)
 
         elif message_type == "sticker":
-            # Ignore stickers - no reply needed
             logger.info(f"Sticker from {user_id} - ignoring")
             continue
 
         elif message_type == "image":
             if form_completed:
                 reply = "ได้รับรูปแล้วค่ะ 😊 มีอะไรให้ช่วยดูไหมคะ?"
-            elif has_form_link_been_sent(user_id):
-                reply = "ได้รับรูปแล้วค่ะ 😊 กรอกฟอร์มเสร็จแล้วบอกพี่ด้วยนะคะ"
+            elif form_link_sent:
+                reply = "ได้รับรูปแล้วค่ะ 😊 กรอกฟอร์มเสร็จแล้วบอกเราด้วยนะคะ จะได้ช่วยน้องต่อได้เลยค่ะ"
             else:
                 form_link = f"{ZOHO_FORM_BASE_URL}?Line_ID={user_id}"
                 reply = (
                     f"ได้รับรูปแล้วค่ะ 😊 ทีมงานดูรูปไม่ได้ "
                     f"แต่ยินดีช่วยเหลือเรื่องที่พักนะคะ "
-                    f"รบกวนกรอกฟอร์มนี้ให้เราก่อนนะคะ 👉 {form_link}"
+                    f"รบกวนกรอกฟอร์มนี้ให้เราก่อนนะคะ {form_link}"
                 )
                 mark_form_link_sent(user_id)
             reply_to_line(reply_token, reply)
@@ -508,10 +445,9 @@ def callback():
         elif message_type in ("audio", "video", "file"):
             reply = (
                 "ได้รับแล้วค่ะ 😊 ทีมงานตอบได้ทางข้อความนะคะ "
-                "พิมพ์คำถามมาได้เลยค่ะ ยินดีช่วยเหลือค่ะ 💬"
+                "พิมพ์คำถามมาได้เลยค่ะ ยินดีช่วยเหลือค่ะ"
             )
             reply_to_line(reply_token, reply)
-
         else:
             logger.info(f"Ignoring message type: {message_type}")
 
@@ -522,7 +458,6 @@ def callback():
 # ============================================================
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint for monitoring."""
     return {
         "status": "ok",
         "bot": "Peyton & Charmed Team Bot",
@@ -539,14 +474,12 @@ def health():
 # ============================================================
 @app.route("/safety/forwarding-only", methods=["POST"])
 def enable_forwarding_only():
-    """Emergency: disable Claude replies, keep Zoho forwarding."""
     global FORWARDING_ONLY
     FORWARDING_ONLY = True
     return {"status": "forwarding_only_enabled", "claude_replies": "disabled"}
 
 @app.route("/safety/full-mode", methods=["POST"])
 def enable_full_mode():
-    """Re-enable Claude replies."""
     global FORWARDING_ONLY
     FORWARDING_ONLY = False
     return {"status": "full_mode_enabled", "claude_replies": "enabled"}
@@ -561,4 +494,3 @@ if __name__ == "__main__":
     logger.info(f"Claude replies: {'disabled' if FORWARDING_ONLY else 'active'}")
     logger.info(f"Form tracking file: {FORM_DATA_FILE}")
     app.run(host="0.0.0.0", port=port)
-
